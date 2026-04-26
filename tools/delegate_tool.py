@@ -1166,6 +1166,67 @@ def _dump_subagent_timeout_diagnostic(
         return None
 
 
+def _safe_child_id(value: Any) -> Optional[str]:
+    """Return a non-empty opaque child identifier, ignoring mock objects."""
+    return value if isinstance(value, str) and value else None
+
+
+def _child_provenance_fields(
+    child: Any,
+    *,
+    child_task_id: Optional[str],
+    subagent_id: Optional[str],
+) -> Dict[str, Any]:
+    """Build bounded child-correlation metadata for delegate results/hooks."""
+    child_session_id = _safe_child_id(getattr(child, "session_id", None))
+    task_id = _safe_child_id(child_task_id)
+    sid = _safe_child_id(subagent_id)
+    gaps: List[str] = []
+    if child_session_id is None:
+        gaps.append("child_session_id_unavailable")
+    if task_id is None:
+        gaps.append("child_task_id_unavailable")
+    if sid is None:
+        gaps.append("child_subagent_id_unavailable")
+    return {
+        "child_session_id": child_session_id or "",
+        "child_task_id": task_id or "",
+        "subagent_id": sid or "",
+        "provenance_evidence_gaps": gaps,
+    }
+
+
+def _summarize_child_tool_trace(tool_trace: Any) -> Dict[str, Any]:
+    """Return a bounded metadata-only summary of child tool activity."""
+    if not isinstance(tool_trace, list):
+        return {"count": 0, "tools": [], "statuses": {}}
+
+    tools: List[str] = []
+    statuses: Dict[str, int] = {}
+    for item in tool_trace:
+        if not isinstance(item, dict):
+            continue
+        tool_name = item.get("tool")
+        if isinstance(tool_name, str) and tool_name not in tools and len(tools) < 8:
+            tools.append(tool_name)
+        status = item.get("status")
+        if isinstance(status, str):
+            statuses[status] = statuses.get(status, 0) + 1
+    summary: Dict[str, Any] = {
+        "count": len([item for item in tool_trace if isinstance(item, dict)]),
+        "tools": tools,
+        "statuses": statuses,
+    }
+    if len(tools) >= 8 and any(
+        isinstance(item, dict)
+        and isinstance(item.get("tool"), str)
+        and item.get("tool") not in tools
+        for item in tool_trace
+    ):
+        summary["tools_truncated"] = True
+    return summary
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -1292,6 +1353,7 @@ def _run_single_child(
     # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    child_task_id = _subagent_id or ""
     if _subagent_id:
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
@@ -1442,6 +1504,11 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                **_child_provenance_fields(
+                    child,
+                    child_task_id=child_task_id,
+                    subagent_id=_subagent_id,
+                ),
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -1538,6 +1605,11 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            **_child_provenance_fields(
+                child,
+                child_task_id=child_task_id,
+                subagent_id=_subagent_id,
+            ),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -1664,6 +1736,11 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            **_child_provenance_fields(
+                child,
+                child_task_id=child_task_id,
+                subagent_id=_subagent_id,
+            ),
         }
 
     finally:
@@ -1958,6 +2035,10 @@ def delegate_task(
                         entry = future.result()
                     except Exception as exc:
                         idx = futures[future]
+                        err_child = _child_by_index.get(idx)
+                        err_subagent_id = _safe_child_id(
+                            getattr(err_child, "_subagent_id", None)
+                        )
                         entry = {
                             "task_index": idx,
                             "status": "error",
@@ -1965,8 +2046,11 @@ def delegate_task(
                             "error": str(exc),
                             "api_calls": 0,
                             "duration_seconds": 0,
-                            "_child_role": getattr(
-                                _child_by_index.get(idx), "_delegate_role", None
+                            "_child_role": getattr(err_child, "_delegate_role", None),
+                            **_child_provenance_fields(
+                                err_child,
+                                child_task_id=err_subagent_id,
+                                subagent_id=err_subagent_id,
                             ),
                         }
                     results.append(entry)
@@ -2046,9 +2130,17 @@ def delegate_task(
             _invoke_hook(
                 "subagent_stop",
                 parent_session_id=_parent_session_id,
+                child_session_id=entry.get("child_session_id", ""),
+                child_task_id=entry.get("child_task_id", ""),
+                child_subagent_id=entry.get("subagent_id", ""),
                 child_role=child_role,
                 child_summary=entry.get("summary"),
                 child_status=entry.get("status"),
+                child_api_calls=int(entry.get("api_calls") or 0),
+                child_tool_trace_summary=_summarize_child_tool_trace(
+                    entry.get("tool_trace")
+                ),
+                evidence_gaps=list(entry.get("provenance_evidence_gaps") or []),
                 duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
             )
         except Exception:

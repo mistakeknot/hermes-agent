@@ -1,0 +1,6 @@
+name: execution-receipts
+version: 0.1.0
+description: "Passive Hermes execution receipt recorder. Disabled unless enabled in plugins.enabled."
+author: "Hermes Agent"
+provides_hooks:
+  - execution_receipt

@@ -1480,6 +1480,28 @@ class TestFormatToolsForSystemMessage:
 
 
 class TestExecuteToolCalls:
+    def _recorded_receipts(self, hook_calls):
+        return [kwargs["receipt"] for name, kwargs in hook_calls if name == "execution_receipt"]
+
+    def _assert_tool_receipt(self, receipt, *, tool_name, tool_call_id, task_id, status="ok"):
+        assert receipt["schema_version"] == "hermes.execution_receipt.v0"
+        assert receipt["receipt_type"] == "tool_complete"
+        assert receipt["receipt_id"]
+        assert receipt["trace_id"]
+        assert receipt["span_id"]
+        assert receipt["sequence_number"] >= 1
+        assert receipt["task_id"] == task_id
+        assert receipt["tool_name"] == tool_name
+        assert receipt["tool_call_id"] == tool_call_id
+        assert receipt["status"] == status
+        assert receipt["duration_ms"] >= 0
+        assert receipt["timestamp"].endswith("Z")
+        assert receipt["redaction"]["strategy"] == "metadata_only"
+        assert receipt["redaction"]["preview_included"] is False
+        assert "args" not in receipt
+        assert "result" not in receipt
+        assert any(link["type"] == "tool_call" and link["id"] == tool_call_id for link in receipt["links"])
+
     def test_single_tool_executed(self, agent):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
@@ -1495,6 +1517,44 @@ class TestExecuteToolCalls:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
+
+    def test_sequential_tool_emits_execution_receipt(self, agent):
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        receipts = self._recorded_receipts(hook_calls)
+        assert len(receipts) == 1
+        self._assert_tool_receipt(
+            receipts[0], tool_name="web_search", tool_call_id="c1", task_id="task-1"
+        )
+        assert receipts[0]["args_metadata"] == {"keys": ["q"]}
+        assert receipts[0]["result_metadata"]["size_chars"] == len("search result")
+
+    def test_execution_receipt_hook_is_fail_open(self, agent):
+        tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=RuntimeError("hook boom")),
+        ):
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        assert len(messages) == 1
+        assert messages[0]["content"] == "search result"
 
     def test_interrupt_skips_remaining(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -1528,6 +1588,35 @@ class TestExecuteToolCalls:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert messages[0]["tool_call_id"] == "c1"
+
+    def test_invalid_json_args_emits_invalid_json_execution_receipt(self, agent):
+        tc = _mock_tool_call(
+            name="web_search", arguments="not valid json", call_id="c1"
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        receipts = self._recorded_receipts(hook_calls)
+        assert len(receipts) == 1
+        self._assert_tool_receipt(
+            receipts[0],
+            tool_name="web_search",
+            tool_call_id="c1",
+            task_id="task-1",
+            status="invalid_json",
+        )
+        assert "tool_arguments_invalid_json_recovered" in receipts[0]["evidence_gaps"]
 
     def test_result_truncation_over_100k(self, agent, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -1632,6 +1721,28 @@ class TestExecuteToolCalls:
 
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
+
+    def _recorded_receipts(self, hook_calls):
+        return [kwargs["receipt"] for name, kwargs in hook_calls if name == "execution_receipt"]
+
+    def _assert_tool_receipt(self, receipt, *, tool_name, tool_call_id, task_id, status="ok"):
+        assert receipt["schema_version"] == "hermes.execution_receipt.v0"
+        assert receipt["receipt_type"] == "tool_complete"
+        assert receipt["receipt_id"]
+        assert receipt["trace_id"]
+        assert receipt["span_id"]
+        assert receipt["sequence_number"] >= 1
+        assert receipt["task_id"] == task_id
+        assert receipt["tool_name"] == tool_name
+        assert receipt["tool_call_id"] == tool_call_id
+        assert receipt["status"] == status
+        assert receipt["duration_ms"] >= 0
+        assert receipt["timestamp"].endswith("Z")
+        assert receipt["redaction"]["strategy"] == "metadata_only"
+        assert receipt["redaction"]["preview_included"] is False
+        assert "args" not in receipt
+        assert "result" not in receipt
+        assert any(link["type"] == "tool_call" and link["id"] == tool_call_id for link in receipt["links"])
 
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
@@ -1784,6 +1895,37 @@ class TestConcurrentToolExecution:
         assert "alpha" in messages[0]["content"]
         assert "beta" in messages[1]["content"]
         assert "gamma" in messages[2]["content"]
+
+    def test_concurrent_emits_execution_receipt_for_each_tool(self, agent):
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"alpha"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"beta"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            return json.dumps({"result": args.get("q", "")})
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=fake_handle),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        receipts = self._recorded_receipts(hook_calls)
+        assert len(receipts) == 2
+        by_id = {receipt["tool_call_id"]: receipt for receipt in receipts}
+        self._assert_tool_receipt(
+            by_id["c1"], tool_name="web_search", tool_call_id="c1", task_id="task-1"
+        )
+        self._assert_tool_receipt(
+            by_id["c2"], tool_name="web_search", tool_call_id="c2", task_id="task-1"
+        )
+        assert sorted(receipt["sequence_number"] for receipt in receipts) == [1, 2]
 
     def test_concurrent_preserves_order_despite_timing(self, agent):
         """Even if tools finish in different order, messages should be in original order."""
@@ -1971,6 +2113,42 @@ class TestConcurrentToolExecution:
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
+
+    def test_blocked_tool_emits_blocked_execution_receipt(self, agent, monkeypatch):
+        tool_call = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"test.txt","content":"hello"}',
+            call_id="c1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+        hook_calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda *args, **kwargs: "Blocked by policy",
+        )
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        receipts = self._recorded_receipts(hook_calls)
+        assert len(receipts) == 1
+        self._assert_tool_receipt(
+            receipts[0],
+            tool_name="write_file",
+            tool_call_id="c1",
+            task_id="task-1",
+            status="blocked",
+        )
+        assert receipts[0]["result_metadata"]["error"] is True
 
     def test_blocked_memory_tool_does_not_reset_counter(self, agent, monkeypatch):
         """Blocked memory tool should not reset the nudge counter."""
@@ -2166,6 +2344,105 @@ class TestRunConversation:
         assert all(call["session_id"] == agent.session_id for call in pre_request_calls)
         assert all("message_count" in c and "messages" not in c for c in pre_request_calls)
         assert all("usage" in c and "response" not in c for c in post_request_calls)
+
+    def test_pre_api_request_hook_is_observational_not_schema_filtering(self, agent):
+        """P0 Skaffen spike characterization: pre_api_request cannot hide tools.
+
+        Skaffen-style phase gating needs to remove tools before the model sees
+        them. Hermes' current pre_api_request hook receives counts/metadata and
+        ignores return values, so it can audit but not filter the outbound tool
+        schema for the current request.
+        """
+        self._setup_agent(agent)
+        original_tools = _make_tool_defs("web_search", "terminal")
+        agent.tools = original_tools
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            if name == "pre_api_request":
+                return [{"tools": [], "api_kwargs": {"tools": []}}]
+            return []
+
+        with (
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Done"
+        pre_request_calls = [kw for name, kw in hook_calls if name == "pre_api_request"]
+        assert len(pre_request_calls) == 1
+        pre = pre_request_calls[0]
+        assert pre["tool_count"] == 2
+        assert "tools" not in pre
+        assert "api_kwargs" not in pre
+        assert "tool_schemas" not in pre
+
+        sent_kwargs = agent.client.chat.completions.create.call_args.kwargs
+        sent_tool_names = [tool["function"]["name"] for tool in sent_kwargs["tools"]]
+        assert sent_tool_names == ["web_search", "terminal"]
+
+    def test_delegate_task_emits_execution_receipt(self, agent):
+        """Agent-loop delegate_task actions emit the same terminal receipt hook as registry tools."""
+        self._setup_agent(agent)
+        agent.tools = _make_tool_defs("delegate_task")
+        agent.valid_tool_names = {"delegate_task"}
+        delegate_call = _mock_tool_call(
+            name="delegate_task",
+            arguments='{"goal": "inspect one thing"}',
+            call_id="delegate-1",
+        )
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[delegate_call])
+        resp2 = _mock_response(content="delegated", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch.object(
+                agent,
+                "_dispatch_delegate_task",
+                return_value=(
+                    '{"results": [{"summary": "done", '
+                    '"child_session_id": "child-session-456", '
+                    '"child_task_id": "subagent-abc", '
+                    '"subagent_id": "subagent-abc"}]}'
+                ),
+            ),
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("delegate this")
+
+        assert result["final_response"] == "delegated"
+        hook_names = [name for name, _ in hook_calls]
+        assert "pre_tool_call" in hook_names
+        receipts = [kwargs["receipt"] for name, kwargs in hook_calls if name == "execution_receipt"]
+        assert len(receipts) == 1
+        receipt = receipts[0]
+        assert receipt["schema_version"] == "hermes.execution_receipt.v0"
+        assert receipt["receipt_type"] == "tool_complete"
+        assert receipt["tool_name"] == "delegate_task"
+        assert receipt["tool_call_id"] == "delegate-1"
+        assert receipt["task_id"]
+        assert receipt["session_id"] == agent.session_id
+        assert receipt["status"] == "ok"
+        assert {"type": "delegate_child_session", "id": "child-session-456"} in receipt["links"]
+        assert {"type": "delegate_child_task", "id": "subagent-abc"} in receipt["links"]
+        assert {"type": "delegate_subagent", "id": "subagent-abc"} in receipt["links"]
+        assert "child_session_id_unavailable" not in receipt["evidence_gaps"]
+        assert "summary" not in receipt["result_metadata"]
 
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)

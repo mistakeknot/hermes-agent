@@ -333,6 +333,9 @@ class TestPluginHooks:
     def test_valid_hooks_include_pre_gateway_dispatch(self):
         assert "pre_gateway_dispatch" in VALID_HOOKS
 
+    def test_valid_hooks_include_execution_receipt_contract(self):
+        assert "execution_receipt" in VALID_HOOKS
+
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
         """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -422,6 +425,67 @@ class TestPluginHooks:
         results = mgr.invoke_hook("post_llm_call", session_id="s1",
                                   user_message="hi", assistant_response="bye", model="test")
         assert results == []
+
+    def test_hook_callback_state_persists_within_loaded_plugin(self, tmp_path, monkeypatch):
+        """P0 Skaffen spike characterization: plugin module/closure state persists.
+
+        A phase FSM can live in a plugin for the lifetime of a loaded plugin
+        manager, but durable cross-process state still needs external storage.
+        """
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "stateful_hook",
+            register_body=(
+                'state = {"count": 0}\n'
+                '    def on_pre(**kw):\n'
+                '        state["count"] += 1\n'
+                '        return {"count": state["count"]}\n'
+                '    ctx.register_hook("pre_llm_call", on_pre)'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        first = mgr.invoke_hook("pre_llm_call", session_id="s1", user_message="one")
+        second = mgr.invoke_hook("pre_llm_call", session_id="s1", user_message="two")
+
+        assert first == [{"count": 1}]
+        assert second == [{"count": 2}]
+
+    def test_user_plugins_are_scoped_by_hermes_home_profile(self, tmp_path, monkeypatch):
+        """P0 Skaffen spike characterization: named profiles isolate plugins.
+
+        Hermes profiles are separate HERMES_HOME directories, so a Skaffen
+        profile can enable policy plugins without enabling them in another
+        profile. This is profile-level isolation, not per-session isolation.
+        """
+        profile_a = tmp_path / "profile_a"
+        profile_b = tmp_path / "profile_b"
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_a))
+        _make_plugin_dir(profile_a / "plugins", "sk_policy")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_b))
+        _make_plugin_dir(profile_b / "plugins", "plain_policy")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_a))
+        mgr_a = PluginManager()
+        mgr_a.discover_and_load()
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_b))
+        mgr_b = PluginManager()
+        mgr_b.discover_and_load()
+
+        assert "sk_policy" in mgr_a._plugins
+        assert mgr_a._plugins["sk_policy"].enabled
+        assert "plain_policy" not in mgr_a._plugins
+
+        assert "plain_policy" in mgr_b._plugins
+        assert mgr_b._plugins["plain_policy"].enabled
+        assert "sk_policy" not in mgr_b._plugins
 
     def test_request_hooks_are_invokeable(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"

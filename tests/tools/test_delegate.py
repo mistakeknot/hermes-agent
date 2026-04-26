@@ -449,6 +449,68 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
 
+    def test_subagent_stop_hook_includes_bounded_child_provenance(self):
+        """subagent_stop exposes opaque child correlation IDs without raw traces."""
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "parent-session-123"
+        hook_calls = []
+
+        def _record_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            return []
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("hermes_cli.plugins.invoke_hook", side_effect=_record_hook),
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-session-456"
+            mock_child._subagent_id = "subagent-abc"
+            mock_child._delegate_role = "leaf"
+            mock_child.session_prompt_tokens = 5000
+            mock_child.session_completion_tokens = 1200
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 3,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_1", "function": {"name": "web_search", "arguments": '{"query": "test"}'}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_1", "content": '{"results": [1,2,3]}'},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test hook evidence", parent_agent=parent))
+
+        entry = result["results"][0]
+        self.assertEqual(entry["child_session_id"], "child-session-456")
+        self.assertTrue(entry["child_task_id"])
+        self.assertEqual(entry["child_task_id"], entry["subagent_id"])
+        self.assertEqual(entry["tool_trace"][0]["tool"], "web_search")
+
+        subagent_stop_calls = [kw for name, kw in hook_calls if name == "subagent_stop"]
+        self.assertEqual(len(subagent_stop_calls), 1)
+        hook_payload = subagent_stop_calls[0]
+        self.assertEqual(hook_payload["parent_session_id"], parent.session_id)
+        self.assertEqual(hook_payload["child_session_id"], "child-session-456")
+        self.assertEqual(hook_payload["child_task_id"], entry["child_task_id"])
+        self.assertEqual(hook_payload["child_subagent_id"], entry["subagent_id"])
+        self.assertEqual(hook_payload["child_role"], "leaf")
+        self.assertEqual(hook_payload["child_status"], "completed")
+        self.assertEqual(hook_payload["child_summary"], "done")
+        self.assertEqual(hook_payload["child_api_calls"], 3)
+        self.assertIn("duration_ms", hook_payload)
+        self.assertEqual(hook_payload["child_tool_trace_summary"]["count"], 1)
+        self.assertEqual(hook_payload["child_tool_trace_summary"]["tools"], ["web_search"])
+        self.assertEqual(hook_payload["evidence_gaps"], [])
+        self.assertNotIn("tool_trace", hook_payload)
+        self.assertNotIn("messages", hook_payload)
+
     def test_tool_trace_detects_error(self):
         """Tool results containing 'error' should be marked as error status."""
         parent = _make_mock_parent(depth=0)

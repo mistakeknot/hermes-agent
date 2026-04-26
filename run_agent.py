@@ -42,7 +42,7 @@ import uuid
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 import fire
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -1094,6 +1094,8 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+        self._execution_receipt_sequence: int = 0
+        self._execution_receipt_sequence_lock = threading.Lock()
 
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
@@ -7992,6 +7994,125 @@ class AIAgent:
                 skip_pre_tool_call_hook=True,
             )
 
+    def _next_execution_receipt_sequence(self) -> int:
+        """Return a per-agent monotonic execution receipt sequence number."""
+        with self._execution_receipt_sequence_lock:
+            self._execution_receipt_sequence += 1
+            return self._execution_receipt_sequence
+
+    @staticmethod
+    def _delegate_receipt_links_and_gaps(result: str) -> tuple[list[dict[str, str]], list[str]]:
+        """Extract opaque child references from a delegate_task result."""
+        links: list[dict[str, str]] = []
+        gaps: list[str] = []
+        try:
+            payload = json.loads(result)
+        except Exception:
+            return links, ["delegate_result_unparseable"]
+
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(results, list):
+            return links, ["delegate_results_unavailable"]
+
+        for entry in results:
+            if not isinstance(entry, dict):
+                gaps.append("delegate_child_result_unstructured")
+                continue
+            child_session_id = entry.get("child_session_id")
+            child_task_id = entry.get("child_task_id")
+            subagent_id = entry.get("subagent_id")
+            if isinstance(child_session_id, str) and child_session_id:
+                links.append({"type": "delegate_child_session", "id": child_session_id})
+            else:
+                gaps.append("child_session_id_unavailable")
+            if isinstance(child_task_id, str) and child_task_id:
+                links.append({"type": "delegate_child_task", "id": child_task_id})
+            else:
+                gaps.append("child_task_id_unavailable")
+            if isinstance(subagent_id, str) and subagent_id:
+                links.append({"type": "delegate_subagent", "id": subagent_id})
+            else:
+                gaps.append("child_subagent_id_unavailable")
+            for gap in entry.get("provenance_evidence_gaps") or []:
+                if isinstance(gap, str):
+                    gaps.append(gap)
+        return links, sorted(set(gaps))
+
+    def _emit_terminal_tool_receipt(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict,
+        tool_call_id: str | None,
+        task_id: str,
+        result: str,
+        duration_seconds: float,
+        status: str | None = None,
+        evidence_gaps: list[str] | None = None,
+        links: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Emit a passive, fail-open execution receipt for a completed tool-like action.
+
+        Receipts intentionally carry metadata only. Raw args/results stay out of
+        the core hook payload so plugins cannot accidentally persist secrets by
+        default.
+        """
+        try:
+            from hermes_cli.plugins import invoke_hook
+
+            is_error, _ = _detect_tool_failure(tool_name, result)
+            if status is None:
+                status = "error" if is_error else "ok"
+
+            gaps = list(evidence_gaps or [])
+            all_links = list(links or [])
+            if tool_name == "delegate_task":
+                delegate_links, delegate_gaps = self._delegate_receipt_links_and_gaps(result)
+                all_links.extend(delegate_links)
+                gaps.extend(delegate_gaps)
+            trace_id = self.session_id or task_id or "unknown"
+            if not self.session_id:
+                gaps.append("missing_session_id")
+            parent_span_id = None
+            gaps.append("parent_span_unavailable")
+
+            receipt_id = uuid.uuid4().hex
+            if tool_call_id:
+                all_links.append({"type": "tool_call", "id": tool_call_id})
+
+            receipt = {
+                "schema_version": "hermes.execution_receipt.v0",
+                "receipt_id": receipt_id,
+                "receipt_type": "tool_complete",
+                "trace_id": trace_id,
+                "span_id": receipt_id,
+                "parent_span_id": parent_span_id,
+                "sequence_number": self._next_execution_receipt_sequence(),
+                "session_id": self.session_id or "",
+                "task_id": task_id or "",
+                "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "status": status,
+                "duration_ms": max(0, int(duration_seconds * 1000)),
+                "args_metadata": {"keys": sorted(tool_args.keys()) if isinstance(tool_args, dict) else []},
+                "result_metadata": {
+                    "size_chars": len(result) if isinstance(result, str) else len(str(result)),
+                    "error": bool(is_error or status in {"error", "blocked", "invalid_json", "cancelled"}),
+                },
+                "redaction": {
+                    "strategy": "metadata_only",
+                    "args_redacted": True,
+                    "result_redacted": True,
+                    "preview_included": False,
+                },
+                "links": all_links,
+                "evidence_gaps": sorted(set(gaps)),
+            }
+            invoke_hook("execution_receipt", receipt=receipt)
+        except Exception as exc:
+            logger.debug("execution_receipt hook failed open: %s", exc)
+
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
         """Word-wrap verbose tool output to fit the terminal width.
@@ -8263,6 +8384,23 @@ class AIAgent:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
+            receipt_status = None
+            if r is None and self._interrupt_requested:
+                receipt_status = "cancelled"
+            elif r is not None and is_error:
+                receipt_status = "error"
+            elif r is None:
+                receipt_status = "error"
+            self._emit_terminal_tool_receipt(
+                tool_name=name,
+                tool_args=args,
+                tool_call_id=tc.id,
+                task_id=effective_task_id,
+                result=function_result,
+                duration_seconds=tool_duration,
+                status=receipt_status,
+            )
+
             # Print cute message per tool
             if self._should_emit_quiet_tool_messages():
                 cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
@@ -8342,13 +8480,19 @@ class AIAgent:
 
             function_name = tool_call.function.name
 
+            arg_evidence_gaps: list[str] = []
+            receipt_status: str | None = None
             try:
                 function_args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError as e:
                 logging.warning(f"Unexpected JSON error after validation: {e}")
                 function_args = {}
+                receipt_status = "invalid_json"
+                arg_evidence_gaps.append("tool_arguments_invalid_json_recovered")
             if not isinstance(function_args, dict):
                 function_args = {}
+                receipt_status = "invalid_json"
+                arg_evidence_gaps.append("tool_arguments_non_dict_recovered")
 
             # Check plugin hooks for a block directive before executing.
             _block_msg: Optional[str] = None
@@ -8437,6 +8581,7 @@ class AIAgent:
                 # Tool blocked by plugin policy — return error without executing.
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
+                receipt_status = "blocked"
             elif function_name == "todo":
                 from tools.todo_tool import todo_tool as _todo_tool
                 function_result = _todo_tool(
@@ -8629,6 +8774,19 @@ class AIAgent:
                     )
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
+
+            if receipt_status is None and _is_error_result:
+                receipt_status = "error"
+            self._emit_terminal_tool_receipt(
+                tool_name=function_name,
+                tool_args=function_args,
+                tool_call_id=tool_call.id,
+                task_id=effective_task_id,
+                result=function_result,
+                duration_seconds=tool_duration,
+                status=receipt_status,
+                evidence_gaps=arg_evidence_gaps,
+            )
 
             self._current_tool = None
             self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
