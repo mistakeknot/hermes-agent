@@ -170,6 +170,35 @@ async def test_auto_registers_missing_gateway_commands(adapter):
 
 
 @pytest.mark.asyncio
+async def test_auto_registers_gateway_command_aliases(adapter):
+    """Gateway-available command aliases should appear in Discord's slash picker."""
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    tree_names = set(adapter._client.tree.commands.keys())
+
+    assert "compact" in tree_names
+    assert "effort" in tree_names
+    assert "reload-plugins" not in tree_names
+    assert "plugins" not in tree_names
+
+
+@pytest.mark.asyncio
+async def test_auto_registered_alias_dispatches_as_alias_text(adapter):
+    """Alias slash commands should dispatch the selected alias text unchanged."""
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    compact_cmd = adapter._client.tree.commands["compact"]
+    interaction = SimpleNamespace()
+    await compact_cmd.callback(interaction, args="token budget")
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/compact token budget"
+    )
+
+
+@pytest.mark.asyncio
 async def test_auto_registered_command_dispatches_correctly(adapter):
     """Auto-registered commands should dispatch via _run_simple_slash."""
     adapter._run_simple_slash = AsyncMock()
