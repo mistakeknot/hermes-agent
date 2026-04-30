@@ -25,6 +25,23 @@ Before setup, here's the part most people want to know: how Hermes behaves once 
 If you want a normal bot-help channel where people can talk to Hermes without tagging it every time, add that channel to `DISCORD_FREE_RESPONSE_CHANNELS`.
 :::
 
+### Discord Response Cards and Choice Buttons
+
+When a response contains a compact `Buttons:` line with two to four bracketed options, Discord can render those options as native buttons while preserving the text line as fallback for transcripts and non-component surfaces:
+
+```md
+**Next — response card**
+
+**Recommendation:** Continue with the proposed next step.
+**Risk/approval:** No privileged action is triggered by the button itself.
+
+Buttons: [Proceed] [Show options] [Pause]
+```
+
+A click is routed back into the same Hermes session as if the user had typed the selected label. The original message is edited to show the selection and disable the buttons. Bot accounts, unauthorized users, expired cards, and already-resolved cards get an ephemeral notice and do not route a new message. Choice buttons are short-lived non-persistent views: they time out after about five minutes and do not survive a gateway restart. This is a response affordance, not a broad Discord management API.
+
+See [Discord Response Cards](../../developer-guide/discord-response-cards.md) for the contract and canonical button sets.
+
 ### Discord Gateway Model
 
 Hermes on Discord is not a webhook that replies statelessly. It runs through the full messaging gateway, which means each incoming message goes through:

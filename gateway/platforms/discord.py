@@ -78,6 +78,41 @@ def _clean_discord_id(entry: str) -> str:
     return entry.strip()
 
 
+_CHOICE_BUTTON_LINE_RE = re.compile(r"^\s*Buttons\s*:\s*(?P<body>.+?)\s*$", re.IGNORECASE)
+_CHOICE_BUTTON_LABEL_RE = re.compile(r"\[([^\[\]\n]{1,80})\]")
+
+
+def _extract_choice_button_labels(content: str) -> list[str]:
+    """Extract a valid Hermes choice-button fallback line from message text.
+
+    A valid line looks like ``Buttons: [Proceed] [Adjust]`` and must contain
+    two to four unique labels.  The text line remains in the message as the
+    cross-platform fallback; Discord may attach native buttons in addition.
+    """
+    if not content or "buttons" not in content.lower():
+        return []
+
+    for line in reversed(content.splitlines()):
+        match = _CHOICE_BUTTON_LINE_RE.match(line)
+        if not match:
+            continue
+        labels = [label.strip() for label in _CHOICE_BUTTON_LABEL_RE.findall(match.group("body"))]
+        labels = [label for label in labels if label]
+        if not (2 <= len(labels) <= 4):
+            return []
+        # Duplicate labels route ambiguously when a click is represented as
+        # normal user text, so reject the native button enhancement and leave
+        # the fallback line as plain text.
+        lowered = [label.casefold() for label in labels]
+        if len(set(lowered)) != len(lowered):
+            return []
+        if any(label.lstrip().startswith(("/", "!")) for label in labels):
+            return []
+        return labels
+
+    return []
+
+
 def check_discord_requirements() -> bool:
     """Check if Discord dependencies are available."""
     return DISCORD_AVAILABLE
@@ -479,7 +514,7 @@ class DiscordAdapter(BasePlatformAdapter):
     - Sending responses with Discord markdown
     - Thread support
     - Native slash commands (/ask, /reset, /status, /stop)
-    - Button-based exec approvals
+    - Button-based exec approvals and choice-card quick replies
     - Auto-threading for long conversations
     - Reaction-based feedback
     """
@@ -1111,6 +1146,32 @@ class DiscordAdapter(BasePlatformAdapter):
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            choice_labels = _extract_choice_button_labels(formatted)
+
+            choice_context: Optional[Dict[str, Any]] = None
+            if choice_labels:
+                route_chat_id = str(thread_id or chat_id)
+                is_thread_target = bool(thread_id) or isinstance(channel, discord.Thread)
+                if isinstance(channel, discord.DMChannel):
+                    chat_type = "dm"
+                    recipient = getattr(channel, "recipient", None)
+                    chat_name = getattr(recipient, "name", None) or getattr(channel, "name", route_chat_id)
+                elif is_thread_target:
+                    chat_type = "thread"
+                    chat_name = self._format_thread_chat_name(channel)
+                else:
+                    chat_type = "group"
+                    chat_name = getattr(channel, "name", route_chat_id)
+                    guild = getattr(channel, "guild", None)
+                    if guild and getattr(guild, "name", None):
+                        chat_name = f"{guild.name} / #{chat_name}"
+                choice_context = {
+                    "chat_id": route_chat_id,
+                    "chat_name": chat_name,
+                    "chat_type": chat_type,
+                    "thread_id": str(thread_id) if thread_id else (route_chat_id if is_thread_target else None),
+                    "chat_topic": self._get_effective_topic(channel, is_thread=is_thread_target),
+                }
 
             message_ids = []
             reference = None
@@ -1130,11 +1191,23 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
-                try:
-                    msg = await channel.send(
+                view = None
+                if choice_labels and choice_context and i == len(chunks) - 1:
+                    view = ChoiceCardView(
+                        adapter=self,
                         content=chunk,
-                        reference=chunk_reference,
+                        choices=choice_labels,
+                        allowed_user_ids=self._allowed_user_ids,
+                        **choice_context,
                     )
+                send_kwargs: Dict[str, Any] = {
+                    "content": chunk,
+                    "reference": chunk_reference,
+                }
+                if view is not None:
+                    send_kwargs["view"] = view
+                try:
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1153,13 +1226,16 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        send_kwargs["reference"] = None
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                if view is not None:
+                    try:
+                        view.message = msg
+                    except Exception:
+                        pass
 
             return SendResult(
                 success=True,
@@ -3713,6 +3789,186 @@ class DiscordAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 if DISCORD_AVAILABLE:
+
+    class ChoiceCardView(discord.ui.View):
+        """Interactive quick-reply buttons for Hermes Discord response cards.
+
+        A click is deliberately equivalent to typing the selected label back
+        into the same Hermes session.  This keeps choice buttons as a response
+        affordance, not as a broad Discord management or executable dispatch
+        API.
+        """
+
+        def __init__(
+            self,
+            *,
+            adapter: DiscordAdapter,
+            content: str,
+            choices: list[str],
+            chat_id: str,
+            chat_name: Optional[str] = None,
+            chat_type: str = "dm",
+            thread_id: Optional[str] = None,
+            chat_topic: Optional[str] = None,
+            allowed_user_ids: Optional[set] = None,
+            timeout: int = 300,
+        ):
+            try:
+                super().__init__(timeout=timeout)
+            except TypeError:
+                # Some unit tests install a minimal ``discord.ui.View`` mock
+                # backed by object.  Keep the runtime path real, but make the
+                # behavior testable without discord.py internals.
+                super().__init__()
+                if not hasattr(self, "children"):
+                    self.children = []
+
+            self.adapter = adapter
+            self.content = content
+            self.choices = choices[:4]
+            self.chat_id = str(chat_id)
+            self.chat_name = chat_name
+            self.chat_type = chat_type
+            self.thread_id = str(thread_id) if thread_id else None
+            self.chat_topic = chat_topic
+            self.allowed_user_ids = set(allowed_user_ids or [])
+            self.message = None
+            self.resolved = False
+            self.expired = False
+            self._build_buttons()
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            user = getattr(interaction, "user", None)
+            if bool(getattr(user, "bot", False)):
+                return False
+            user_id = getattr(user, "id", None)
+            if user_id is None:
+                return False
+            is_allowed = getattr(self.adapter, "_is_allowed_user", None)
+            if callable(is_allowed):
+                return bool(is_allowed(str(user_id), user))
+            if not self.allowed_user_ids:
+                return True
+            return str(user_id) in self.allowed_user_ids
+
+        @staticmethod
+        def _style_for_choice(label: str, index: int):
+            styles = discord.ButtonStyle
+            lowered = label.strip().casefold()
+            danger_labels = {"stop", "cancel", "pause", "defer", "deny"}
+            if index == 0:
+                return getattr(styles, "green", getattr(styles, "success", None))
+            if lowered in danger_labels:
+                return getattr(styles, "red", getattr(styles, "danger", None))
+            if "detail" in lowered or "options" in lowered or "context" in lowered:
+                return getattr(styles, "grey", getattr(styles, "secondary", None))
+            return getattr(styles, "blurple", getattr(styles, "primary", None))
+
+        def _add_button_item(self, button) -> None:
+            add_item = getattr(self, "add_item", None)
+            if callable(add_item):
+                add_item(button)
+                return
+            if not hasattr(self, "children"):
+                self.children = []
+            self.children.append(button)
+
+        def _build_buttons(self) -> None:
+            for index, choice in enumerate(self.choices):
+                label = choice[:80]
+                button = discord.ui.Button(
+                    label=label,
+                    style=self._style_for_choice(label, index),
+                    custom_id=f"hermes_choice:{index}",
+                )
+
+                async def _callback(interaction: discord.Interaction, selected=choice):
+                    await self._on_choice_selected(interaction, selected)
+
+                button.callback = _callback
+                self._add_button_item(button)
+
+        def _disable_buttons(self) -> None:
+            for child in getattr(self, "children", []):
+                try:
+                    child.disabled = True
+                except Exception:
+                    pass
+
+        async def _send_ephemeral(self, interaction: discord.Interaction, message: str) -> None:
+            try:
+                await interaction.response.send_message(message, ephemeral=True)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.debug("Discord choice-card ephemeral response failed: %s", exc)
+
+        def _selected_content(self, choice: str, user_name: str) -> str:
+            suffix = f"\n\n_Selected: **{choice}** by {user_name}_"
+            if len(self.content) + len(suffix) <= DiscordAdapter.MAX_MESSAGE_LENGTH:
+                return self.content + suffix
+            return f"Selected: **{choice}** by {user_name}"
+
+        def _build_choice_event(self, interaction: discord.Interaction, choice: str) -> MessageEvent:
+            user = getattr(interaction, "user", None)
+            user_name = getattr(user, "display_name", None) or getattr(user, "name", None)
+            raw_message = getattr(interaction, "message", None)
+            message_id = getattr(raw_message, "id", None)
+            source = self.adapter.build_source(
+                chat_id=self.chat_id,
+                chat_name=self.chat_name,
+                chat_type=self.chat_type,
+                user_id=str(getattr(user, "id", "")) if user else None,
+                user_name=user_name,
+                thread_id=self.thread_id,
+                chat_topic=self.chat_topic,
+                is_bot=bool(getattr(user, "bot", False)) if user else False,
+            )
+            return MessageEvent(
+                text=choice,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=raw_message or interaction,
+                message_id=str(message_id) if message_id is not None else None,
+            )
+
+        async def _on_choice_selected(self, interaction: discord.Interaction, choice: str) -> None:
+            if self.expired:
+                await self._send_ephemeral(interaction, "This choice card has expired~")
+                return
+            if self.resolved:
+                await self._send_ephemeral(interaction, "This choice card has already been resolved~")
+                return
+            if not self._check_auth(interaction):
+                await self._send_ephemeral(interaction, "You're not authorized to use this choice card~")
+                return
+
+            self.resolved = True
+            self._disable_buttons()
+            user = getattr(interaction, "user", None)
+            user_name = getattr(user, "display_name", None) or getattr(user, "name", "user")
+            try:
+                await interaction.response.edit_message(
+                    content=self._selected_content(choice, user_name),
+                    view=self,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.debug("Discord choice-card edit failed: %s", exc)
+
+            try:
+                await self.adapter.handle_message(self._build_choice_event(interaction, choice))
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.error("Failed to route Discord choice-card click: %s", exc, exc_info=True)
+
+        async def on_timeout(self):
+            self.expired = True
+            self.resolved = True
+            self._disable_buttons()
+            message = getattr(self, "message", None)
+            if message is not None and hasattr(message, "edit"):
+                try:
+                    await message.edit(view=self)
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.debug("Discord choice-card timeout edit failed: %s", exc)
+
 
     class ExecApprovalView(discord.ui.View):
         """
