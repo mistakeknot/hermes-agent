@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { BUILTIN_THEME_LIST, DEFAULT_TYPOGRAPHY, EMOJI_FALLBACK } from './presets'
+import { contrastRatio, luminance } from './color'
+import { BUILTIN_THEME_LIST, BUILTIN_THEMES, DEFAULT_TYPOGRAPHY, EMOJI_FALLBACK } from './presets'
 
 // #40364: none of the UI text/mono fonts carry emoji glyphs, so every font
 // stack must end with a color-emoji fallback or emoji render as tofu on
@@ -29,5 +30,25 @@ describe('theme typography emoji fallback (#40364)', () => {
     expect(EMOJI_FALLBACK).toContain('Apple Color Emoji')
     expect(EMOJI_FALLBACK).toContain('Segoe UI Emoji')
     expect(EMOJI_FALLBACK).toContain('Noto Color Emoji')
+  })
+})
+
+describe('built-in desktop themes', () => {
+  it('ships the Nousromancer palette as a first-class built-in theme', () => {
+    const theme = BUILTIN_THEMES.nousromancer
+    const darkColors = theme.darkColors
+
+    expect(BUILTIN_THEME_LIST).toContain(theme)
+    expect(theme.label).toBe('Nousromancer')
+    expect(darkColors).toBeDefined()
+    expect(theme.terminal).toEqual(expect.objectContaining({ foreground: expect.any(String) }))
+    expect(theme.darkTerminal).toEqual(expect.objectContaining({ foreground: expect.any(String) }))
+
+    expect(luminance(theme.colors.background)).toBeGreaterThan(0.5)
+    expect(luminance(darkColors?.background ?? '#FFFFFF')).toBeLessThanOrEqual(0.5)
+    expect(contrastRatio(theme.colors.background, theme.colors.foreground)).toBeGreaterThanOrEqual(4.5)
+    expect(
+      contrastRatio(darkColors?.background ?? '#000000', darkColors?.foreground ?? '#000000')
+    ).toBeGreaterThanOrEqual(4.5)
   })
 })

@@ -9,8 +9,7 @@ import type { DesktopTheme, DesktopThemeTypography } from './types'
 // text/mono fonts carry emoji glyphs, so without this emoji render as tofu
 // boxes on platforms whose default text font lacks them (e.g. Linux/#40364).
 // Covers macOS, Windows, Linux, plus the `emoji` generic for anything else.
-export const EMOJI_FALLBACK =
-  '"Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", emoji'
+export const EMOJI_FALLBACK = '"Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", emoji'
 
 const SYSTEM_SANS =
   '"Segoe WPC", "Segoe UI", -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif, ' +
@@ -132,6 +131,117 @@ export const midnightTheme: DesktopTheme = {
   typography: {
     fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
     fontUrl: 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap'
+  }
+}
+
+/**
+ * Blackened rose, electric blue, and violet. A romantic hacker palette for the
+ * desktop app — dark-first, but with a soft blush light variant.
+ */
+export const nousromancerTheme: DesktopTheme = {
+  name: 'nousromancer',
+  label: 'Nousromancer',
+  description: 'Black, millennial pink, electric blue, and violet',
+  colors: {
+    background: '#FFF7FB',
+    foreground: '#191021',
+    card: '#FFFFFF',
+    cardForeground: '#191021',
+    muted: '#F6E7F0',
+    mutedForeground: '#796275',
+    popover: '#FFFFFF',
+    popoverForeground: '#191021',
+    primary: '#8F315E',
+    primaryForeground: '#FFFFFF',
+    secondary: '#EAF0FF',
+    secondaryForeground: '#29345F',
+    accent: '#F1E8FF',
+    accentForeground: '#3B2868',
+    border: '#E6CFE0',
+    input: '#EBD7E4',
+    ring: '#6F8EF6',
+    midground: '#7E5BEF',
+    midgroundForeground: '#FFFFFF',
+    composerRing: '#C15E8A',
+    destructive: '#B73E5D',
+    destructiveForeground: '#FFFFFF',
+    sidebarBackground: '#FDEFF7',
+    sidebarBorder: '#EAD2E2',
+    userBubble: '#EDF2FF',
+    userBubbleBorder: '#BACAFE'
+  },
+  darkColors: {
+    background: '#08060D',
+    foreground: '#FBEAF1',
+    card: '#11101A',
+    cardForeground: '#FBEAF1',
+    muted: '#1B1726',
+    mutedForeground: '#B99CB0',
+    popover: '#151221',
+    popoverForeground: '#FBEAF1',
+    primary: '#F4A7C8',
+    primaryForeground: '#180712',
+    secondary: '#1B2B54',
+    secondaryForeground: '#DCE8FF',
+    accent: '#2B1D4E',
+    accentForeground: '#F3D7FF',
+    border: '#3A2B52',
+    input: '#241B35',
+    ring: '#8BB8FF',
+    midground: '#A78BFA',
+    midgroundForeground: '#13091F',
+    composerRing: '#F4A7C8',
+    destructive: '#FF6B8A',
+    destructiveForeground: '#21030A',
+    sidebarBackground: '#05050A',
+    sidebarBorder: '#211832',
+    userBubble: '#151B35',
+    userBubbleBorder: '#3B5FFF'
+  },
+  terminal: {
+    foreground: '#2C1731',
+    cursor: '#8F315E',
+    selectionBackground: '#E8CFE1AA',
+    black: '#1D1426',
+    red: '#B73E5D',
+    green: '#1F7A55',
+    yellow: '#9B5A00',
+    blue: '#315FBD',
+    magenta: '#8F315E',
+    cyan: '#0F766E',
+    white: '#F7EFF6',
+    brightBlack: '#776179',
+    brightRed: '#D94F72',
+    brightGreen: '#2F9C70',
+    brightYellow: '#B7791F',
+    brightBlue: '#4C7FE6',
+    brightMagenta: '#A855F7',
+    brightCyan: '#0891B2',
+    brightWhite: '#FFFFFF'
+  },
+  darkTerminal: {
+    foreground: '#FBEAF1',
+    cursor: '#F4A7C8',
+    selectionBackground: '#3F2B55AA',
+    black: '#0A0710',
+    red: '#FF6B8A',
+    green: '#7EE7B2',
+    yellow: '#F6C177',
+    blue: '#8BB8FF',
+    magenta: '#F4A7C8',
+    cyan: '#8BE9FD',
+    white: '#EDE7F6',
+    brightBlack: '#4F3F5F',
+    brightRed: '#FF8FAB',
+    brightGreen: '#A7F3D0',
+    brightYellow: '#FFD6A5',
+    brightBlue: '#A7C7FF',
+    brightMagenta: '#D8B4FE',
+    brightCyan: '#BAE6FD',
+    brightWhite: '#FFFFFF'
+  },
+  typography: {
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`
   }
 }
 
@@ -281,6 +391,7 @@ export const slateTheme: DesktopTheme = {
 export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
   nous: nousTheme,
   midnight: midnightTheme,
+  nousromancer: nousromancerTheme,
   ember: emberTheme,
   mono: monoTheme,
   cyberpunk: cyberpunkTheme,
